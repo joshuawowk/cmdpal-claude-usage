@@ -16,6 +16,10 @@ internal sealed class UsageDockBand
     private readonly ListItem _tile;
     private readonly string _baseTitle;
     private readonly string _titleSuffix;
+    // Serializes overlapping refresh ticks: a slow fetch can let the next timer
+    // tick start before this one finishes, which would otherwise interleave the
+    // _lowQuotaNotified read-check-write (double-firing the toast) and the tile writes.
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
     // Last icon state applied, so the icon object is only swapped on transitions.
     private bool _appliedLowQuota;
     // Whether the current dip below the threshold has already produced a toast.
@@ -46,11 +50,28 @@ internal sealed class UsageDockBand
     }
 
     /// <summary>
-    /// Called on every provider timer tick: re-reads usage (usually served from
-    /// the service's cache) and rewrites the tile's title, subtitle, and icon.
-    /// Failures render as a short status message instead of numbers.
+    /// Called on every provider timer tick. Serializes against a still-running
+    /// previous tick so their tile/flag writes can't interleave.
     /// </summary>
     public async Task RefreshAsync()
+    {
+        await _refreshGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await RefreshCoreAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Re-reads usage (usually served from the service's cache) and rewrites the
+    /// tile's title, subtitle, and icon. Failures render as a short status message
+    /// instead of numbers.
+    /// </summary>
+    private async Task RefreshCoreAsync()
     {
         var result = await _usageService.GetSnapshotAsync().ConfigureAwait(false);
 

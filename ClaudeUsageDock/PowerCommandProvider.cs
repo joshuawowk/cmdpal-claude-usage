@@ -33,7 +33,21 @@ public sealed partial class PowerCommandProvider : CommandProvider, IDisposable
         RebuildProfiles();
 
         _dockRefreshTimer = new Timer(
-            async _ => await RefreshAllAsync().ConfigureAwait(false),
+            async _ =>
+            {
+                // The timer callback is async void: any exception that escaped
+                // RefreshAllAsync would become an unobserved exception on a thread
+                // pool thread and terminate the extension host. Swallow it — the
+                // next tick retries and the tiles render their own failure states.
+                try
+                {
+                    await RefreshAllAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    DebugLogger.Log($"Dock refresh tick failed: {ex.Message}");
+                }
+            },
             state: null,
             dueTime: TimeSpan.Zero,
             period: _settingsManager.DockRefreshInterval);
