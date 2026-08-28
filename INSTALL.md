@@ -1,6 +1,6 @@
 # 🛠️ Installation Guide
 
-This guide covers two ways to install **Claude Power Command Extension**: downloading a prebuilt, signed release (no SDKs needed), or building from source.
+This guide covers two ways to install **Claude Usage Dock**: downloading a prebuilt, signed release (no SDKs needed), or building from source.
 
 ## 🚀 Option A: Install a prebuilt release
 
@@ -47,7 +47,7 @@ winget install Microsoft.WindowsSDK.10.0.26100   # must match the csproj's Targe
 
 ```powershell
 git clone git@gitlab.com:shaikh.rashid/claude-command-palette-dock.git
-cd "Claude Power Command Extension"
+cd claude-command-palette-dock
 ```
 
 ### 3. 🏗️ Build and install
