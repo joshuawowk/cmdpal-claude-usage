@@ -93,6 +93,9 @@ public sealed class ClaudeUsageService : IDisposable
     /// </summary>
     private StoredCredentials? _memoryCredentials;
 
+    /// <summary>Set in <see cref="Dispose"/>; lets an in-flight fetch bail out instead of throwing on the disposed lock when a profile rebuild disposes this service mid-refresh.</summary>
+    private volatile bool _disposed;
+
     /// <param name="credentialsFilePath">
     /// Overrides where the OAuth token is read from, for monitoring a secondary
     /// account whose credentials were saved to a different file. Defaults to
@@ -126,8 +129,25 @@ public sealed class ClaudeUsageService : IDisposable
             return UsageFetchResult.Ok(_lastSnapshot!);
         }
 
+        // A profile rebuild can dispose this service while a refresh tick (or an
+        // open details page) is still calling into it. Tolerate the raced disposal
+        // by serving stale/failure instead of throwing ObjectDisposedException up
+        // into the async-void refresh timer, which would crash the extension host.
+        if (_disposed)
+        {
+            return StaleOrFailure();
+        }
+
         // Single-flight: the dock timer and a page open can race; only one request goes out.
-        await _fetchLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await _fetchLock.WaitAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            return StaleOrFailure();
+        }
+
         try
         {
             if (!bypassCache && IsCacheFresh())
@@ -155,7 +175,14 @@ public sealed class ClaudeUsageService : IDisposable
         }
         finally
         {
-            _fetchLock.Release();
+            try
+            {
+                _fetchLock.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Disposed mid-fetch by a profile rebuild; nothing left to release.
+            }
         }
     }
 
@@ -250,6 +277,16 @@ public sealed class ClaudeUsageService : IDisposable
             DebugLogger.Log($"Could not parse usage response: {ex.Message}");
             return UsageFetchResult.Failure(UsageFetchOutcome.UnexpectedResponse);
         }
+        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException)
+        {
+            // A 200 whose body is valid JSON but the wrong shape: the hard JsonElement
+            // getters throw these (not JsonException). Map them to UnexpectedResponse
+            // too so an off-shape response degrades gracefully instead of escaping the
+            // refresh path. ParseSnapshot already avoids this for the fields it reads,
+            // but this keeps the whole parse total as a backstop.
+            DebugLogger.Log($"Unexpected usage response shape: {ex.Message}");
+            return UsageFetchResult.Failure(UsageFetchOutcome.UnexpectedResponse);
+        }
     }
 
     /// <summary>
@@ -264,11 +301,16 @@ public sealed class ClaudeUsageService : IDisposable
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
 
-        var fiveHour = root.GetProperty("five_hour");
-        var sevenDay = root.GetProperty("seven_day");
+        // Read the required fields through helpers that raise JsonException (rather
+        // than the KeyNotFoundException/InvalidOperationException the hard getters
+        // throw) when the response is valid JSON but the wrong shape, so the caller's
+        // JsonException catch maps it to UnexpectedResponse instead of letting it
+        // escape the refresh path and crash the host.
+        var fiveHour = RequireObject(root, "five_hour");
+        var sevenDay = RequireObject(root, "seven_day");
 
-        var sessionUsedPercent = fiveHour.GetProperty("utilization").GetDouble();
-        var weeklyUsedPercent = sevenDay.GetProperty("utilization").GetDouble();
+        var sessionUsedPercent = RequireDouble(fiveHour, "utilization");
+        var weeklyUsedPercent = RequireDouble(sevenDay, "utilization");
 
         var perModel = new List<ModelUsage>();
         if (root.TryGetProperty("limits", out var limits) && limits.ValueKind == JsonValueKind.Array)
@@ -286,10 +328,17 @@ public sealed class ClaudeUsageService : IDisposable
                     continue;
                 }
 
-                perModel.Add(new ModelUsage(
-                    modelName,
-                    limit.GetProperty("percent").GetDouble(),
-                    ParseResetTime(limit.GetPropertyOrNull("resets_at")?.GetString())));
+                // Include a per-model entry only when its percent is present and
+                // numeric, matching the graceful skips above rather than failing the
+                // whole snapshot on one malformed limit row.
+                if (limit.GetPropertyOrNull("percent") is { ValueKind: JsonValueKind.Number } percentElement &&
+                    percentElement.TryGetDouble(out var percentUsed))
+                {
+                    perModel.Add(new ModelUsage(
+                        modelName,
+                        percentUsed,
+                        ParseResetTime(limit.GetPropertyOrNull("resets_at")?.GetString())));
+                }
             }
         }
 
@@ -302,6 +351,18 @@ public sealed class ClaudeUsageService : IDisposable
             PlanType: planType,
             RetrievedAt: DateTimeOffset.UtcNow);
     }
+
+    /// <summary>A required object field, or a JsonException (→ UnexpectedResponse) when it's absent or not an object.</summary>
+    private static JsonElement RequireObject(JsonElement parent, string propertyName) =>
+        parent.GetPropertyOrNull(propertyName) is { ValueKind: JsonValueKind.Object } value
+            ? value
+            : throw new JsonException($"Usage response is missing the object field '{propertyName}'.");
+
+    /// <summary>A required numeric field as a double, or a JsonException (→ UnexpectedResponse) when it's absent or not a number.</summary>
+    private static double RequireDouble(JsonElement parent, string propertyName) =>
+        parent.GetPropertyOrNull(propertyName) is { ValueKind: JsonValueKind.Number } value && value.TryGetDouble(out var number)
+            ? number
+            : throw new JsonException($"Usage response field '{propertyName}' is missing or not a number.");
 
     /// <summary>Keeps a server-provided Retry-After within sane bounds (30 s – 15 min).</summary>
     private static TimeSpan Clamp(TimeSpan backoff) =>
@@ -352,8 +413,14 @@ public sealed class ClaudeUsageService : IDisposable
                 expiresAt,
                 oauth?.GetPropertyOrNull("subscriptionType")?.GetString());
         }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException
+            or ArgumentOutOfRangeException or FormatException or OverflowException)
         {
+            // ArgumentOutOfRangeException/FormatException/OverflowException guard a
+            // corrupt or hand-edited credentials file (e.g. an out-of-range expiresAt
+            // that DateTimeOffset.FromUnixTimeMilliseconds rejects) so any parse
+            // problem degrades to "no credentials" instead of throwing into the
+            // refresh path, honoring this method's documented contract.
             DebugLogger.Log($"Could not read Claude Code credentials file: {ex.Message}");
             return new StoredCredentials(null, null, null, null);
         }
@@ -405,15 +472,25 @@ public sealed class ClaudeUsageService : IDisposable
             using var document = JsonDocument.Parse(body);
             var root = document.RootElement;
 
-            var accessToken = root.GetPropertyOrNull("access_token")?.GetString();
+            // Read defensively by ValueKind: a wrong-typed field (e.g. a numeric
+            // access_token) would otherwise throw InvalidOperationException out of
+            // this method, which is awaited outside FetchFromApiAsync's try.
+            var accessToken = root.GetPropertyOrNull("access_token") is { ValueKind: JsonValueKind.String } accessTokenElement
+                ? accessTokenElement.GetString()
+                : null;
             if (string.IsNullOrEmpty(accessToken))
             {
                 DebugLogger.Log("Token refresh response contained no access token.");
                 return null;
             }
 
-            var refreshToken = root.GetPropertyOrNull("refresh_token")?.GetString() ?? current.RefreshToken;
-            var expiresInSeconds = root.GetPropertyOrNull("expires_in")?.GetDouble() ?? 3600;
+            var refreshToken = (root.GetPropertyOrNull("refresh_token") is { ValueKind: JsonValueKind.String } refreshTokenElement
+                ? refreshTokenElement.GetString()
+                : null) ?? current.RefreshToken;
+            var expiresInSeconds = root.GetPropertyOrNull("expires_in") is { ValueKind: JsonValueKind.Number } expiresInElement
+                && expiresInElement.TryGetDouble(out var seconds)
+                ? seconds
+                : 3600;
             var expiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresInSeconds);
 
             var refreshed = current with { AccessToken = accessToken, RefreshToken = refreshToken, ExpiresAt = expiresAt };
@@ -422,8 +499,12 @@ public sealed class ClaudeUsageService : IDisposable
             DebugLogger.Log("Access token refreshed.");
             return refreshed;
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException
+            or InvalidOperationException or FormatException)
         {
+            // InvalidOperationException/FormatException cover a wrong-typed refresh
+            // response so it degrades to a graceful "refresh didn't succeed" (null)
+            // rather than escaping — this method is awaited outside the caller's try.
             DebugLogger.Log($"Token refresh failed: {ex.Message}");
             return null;
         }
@@ -461,6 +542,9 @@ public sealed class ClaudeUsageService : IDisposable
 
     public void Dispose()
     {
+        // Flag first so a concurrent in-flight fetch sees it and bails before it
+        // touches the semaphore we're about to dispose.
+        _disposed = true;
         _fetchLock.Dispose();
     }
 }

@@ -1,4 +1,4 @@
-# 📊 Claude Power Command Extension
+# 📊 Claude Usage Dock
 
 A [PowerToys Command Palette](https://aka.ms/PowerToysOverview_CommandPalette) extension that shows live **Claude Code subscription usage** as a tile in the Command Palette **Dock**, plus a tabbed detail page: usage bars, a what's-using-your-limits breakdown, and a monthly heatmap.
 
@@ -41,7 +41,7 @@ See **[INSTALL.md](INSTALL.md)** for full step-by-step instructions, troubleshoo
 
 ```powershell
 git clone git@gitlab.com:shaikh.rashid/claude-command-palette-dock.git
-cd "Claude Power Command Extension"
+cd claude-command-palette-dock
 .\build-and-install.ps1
 ```
 

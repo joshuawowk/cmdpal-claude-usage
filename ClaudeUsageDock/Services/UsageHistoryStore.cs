@@ -60,8 +60,10 @@ public sealed class UsageHistoryStore
                     Prune();
                 }
             }
-            catch (IOException ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                // Also covers Prune (invoked inside this try). History is best-effort;
+                // a read-only or ACL-denied file must never escape into the refresh path.
                 DebugLogger.Log($"Could not append usage history: {ex.Message}");
             }
         }
@@ -87,7 +89,7 @@ public sealed class UsageHistoryStore
                     .OrderBy(p => p.Timestamp)
                     .ToList();
             }
-            catch (IOException ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 DebugLogger.Log($"Could not read usage history: {ex.Message}");
                 return [];
